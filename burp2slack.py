@@ -1,7 +1,8 @@
 # A simple Burp Suite Extension to send issue notifications to a Slack channel while scanning
 # Author: David Espejo (Fortytwo Security) david@fortytwo.nl
 import json
-# import logging
+import logging
+import sys
 from burp import IBurpExtender
 from burp import IScannerListener
 from burp import IHttpListener
@@ -13,7 +14,43 @@ from java.net import URL, URLEncoder
 from java.net import HttpURLConnection
 from javax.net.ssl import HttpsURLConnection
 
-# logging.basicConfig(filename='burp2slack.log', level=logging.DEBUG)
+# Route diagnostics to the file configured here AND to Burp's own output/error
+# stream, so a failed delivery is visible even if the log file is unwritable.
+# Burp captures stderr from extension threads and shows it in the Extensions >
+# Errors output tab.
+LOG_FILENAME = 'burp2slack.log'
+logging.basicConfig(
+    filename=LOG_FILENAME,
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
+
+
+def _log(level, message):
+    """Emit to the log file and to Burp's output stream.
+
+    Both sinks are used deliberately: the file survives a restart, stderr is
+    what a user sees while scanning.
+
+    Uses sys.stderr.write rather than print(..., file=...) because Burp's
+    embedded Jython is Python 2.7, where print(file=...) is a SyntaxError.
+    """
+    try:
+        level_no = logging.getLevelName(level)
+        if isinstance(level_no, int):
+            logging.log(level_no, message)
+    except Exception as e:
+        # Never let logging itself break issue processing, but do not fail
+        # silently either: a broken log sink is exactly the kind of failure
+        # this extension was supposed to surface.
+        try:
+            sys.stderr.write("[Burp2SlackIssues] logging failure: {}\n".format(e))
+        except Exception:
+            pass
+    try:
+        sys.stderr.write("[Burp2SlackIssues] {}: {}\n".format(level, message))
+    except Exception:
+        pass
 
 class BurpExtender(IBurpExtender, IScannerListener, IHttpListener, ITab):
     def registerExtenderCallbacks(self, callbacks):
@@ -131,6 +168,7 @@ class BurpExtender(IBurpExtender, IScannerListener, IHttpListener, ITab):
 
     def newScanIssue(self, issue):
         # logging.debug('newScanIssue called')
+        issueDetails = None
         try:
             if self.severityBox[issue.getSeverity()].isSelected() and self.confidenceBox[issue.getConfidence()].isSelected():
                 # logging.debug('Severity and Confidence selected')
@@ -154,11 +192,13 @@ class BurpExtender(IBurpExtender, IScannerListener, IHttpListener, ITab):
                 for chunk in chunks:
                     self.send_notification(chunk)
         except Exception as e:
-            # logging.error('Error in newScanIssue: ' + str(e))
-            # logging.debug('Issue details were: ' + json.dumps(issueDetails))  # Log the issue details
-            pass
+            # Previously this handler was a bare `pass`, so every failure to
+            # build or deliver a notification was invisible.
+            _log('ERROR', 'Error in newScanIssue: {}'.format(e))
+            _log('DEBUG', 'Issue details were: {}'.format(issueDetails))
 
     def send_notification(self, text):
+        params = None
         try:
             url = URL(self.webhookInput.getText())
             connection = url.openConnection()
@@ -170,7 +210,7 @@ class BurpExtender(IBurpExtender, IScannerListener, IHttpListener, ITab):
             payload = {"text": text}
             params = "payload={}".format(URLEncoder.encode(json.dumps(payload), "UTF-8"))
 
-            # logging.debug('Sending notification with payload: {}'.format(params))  # Log the payload
+            _log('DEBUG', 'Sending notification with payload: {}'.format(params))
 
             output = connection.getOutputStream()
             output.write(params.encode("UTF-8"))
@@ -179,15 +219,17 @@ class BurpExtender(IBurpExtender, IScannerListener, IHttpListener, ITab):
             responseCode = connection.getResponseCode()
             responseMessage = connection.getResponseMessage()
 
-            # logging.debug("Slack response code: {}".format(responseCode))
-            # logging.debug("Slack response message: {}".format(responseMessage))
+            _log('DEBUG', "Slack response code: {}".format(responseCode))
+            _log('DEBUG', "Slack response message: {}".format(responseMessage))
             if responseCode != HttpURLConnection.HTTP_OK:
-                pass
-                # logging.error("Failed to send message to Slack")
+                # Previously `pass`: a 4xx/5xx from Slack was silently discarded.
+                _log('ERROR', "Failed to send message to Slack: HTTP {} {}".format(responseCode, responseMessage))
 
         except Exception as e:
-            pass
-            # logging.error("Failed to send message to Slack: {} Payload was: {}".format(e, params))  # Log the exception and the payload
+            # Previously `pass`: every transport-level failure was invisible.
+            # `params` may be unbound if the failure happened before line 171.
+            _log('ERROR', "Failed to send message to Slack: {}".format(e))
+            _log('DEBUG', "Payload was: {}".format(params))
 
     def getTabCaption(self):
         return "Burp2SlackIssues"
